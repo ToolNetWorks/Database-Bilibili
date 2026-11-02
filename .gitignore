@@ -1,0 +1,22 @@
+/secrets/
+/data/temp/
+
+# Secrets
+/secrets/
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Media and runtime files
+/data/
+/logs/
+*.aria2
+
+# Node.js
+node_modules/
