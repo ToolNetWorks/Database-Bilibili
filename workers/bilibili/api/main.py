@@ -152,7 +152,7 @@ def get_channel_videos(uid: str) -> list[dict]:
 
 
 @app.get("/health")
-def health():
+async def health():
     return {
         "success": True,
         "service": "database-bilibili",

@@ -19,6 +19,24 @@ Contents:
 
 Your Render Web Service should redeploy automatically if auto-deploy is enabled.
 
+## Wake the API before use
+
+Render's free service can sleep after inactivity. When a user opens a page or
+begins a flow that may need the API, start a request in the background:
+
+```js
+// Call early, without blocking the page or exposing an API key.
+fetch('https://database-bilibili.onrender.com/health', {
+  mode: 'no-cors',
+  cache: 'no-store',
+  signal: AbortSignal.timeout(120000),
+}).catch(() => {});
+```
+
+The `no-cors` response is opaque: it can wake the service but cannot confirm
+readiness. API callers should still handle cold starts, timeouts, and errors.
+`/health` does not check Neon; `/ready` checks database availability.
+
 ## URLs after deployment
 
 - `https://database-bilibili.onrender.com/api-docs`: custom docs page, including interactive POST tester.
