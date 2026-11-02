@@ -4,7 +4,8 @@ import re
 import secrets
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Security
+from fastapi.security import APIKeyHeader
 from workers.bilibili.api import neon_store
 
 app = FastAPI(
@@ -31,7 +32,10 @@ ALLOWED_STATUSES = {
 }
 
 
-def require_api_key(x_api_key: str | None = Header(default=None)):
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(x_api_key: str | None = Security(api_key_header)):
     configured_key = os.getenv("BILIBILI_API_KEY", "")
 
     if not configured_key:
@@ -315,3 +319,8 @@ def get_video(bvid: str):
                 return {"success": True, "video": video}
 
     raise HTTPException(404, "Video not found")
+
+
+# Public docs landing page and authenticated read-only POST endpoint.
+from workers.bilibili.api.docs_api import install_docs_api
+install_docs_api(app, require_api_key, neon_store, format_duration)
