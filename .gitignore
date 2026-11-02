@@ -30,3 +30,6 @@ logs/
 .venv/
 __pycache__/
 *.pyc
+
+# Local backups
+*.bak
