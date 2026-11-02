@@ -20,3 +20,13 @@ __pycache__/
 
 # Node.js
 node_modules/
+
+# Private credentials and runtime data
+.env
+.env.*
+secrets/
+data/
+logs/
+.venv/
+__pycache__/
+*.pyc

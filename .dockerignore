@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+secrets/
+data/
+logs/
+.venv/
+migrations/
+scripts/
+__pycache__/
+*.pyc
+*.log
+*.sql

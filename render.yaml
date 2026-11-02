@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: database-bilibili-api
+    runtime: docker
+    region: singapore
+    plan: free
+    branch: main
+
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+
+    healthCheckPath: /ready
+
+    envVars:
+      - key: PORT
+        value: "10000"
+
+      - key: DATABASE_URL
+        sync: false
+
+      - key: BILIBILI_API_KEY
+        sync: false

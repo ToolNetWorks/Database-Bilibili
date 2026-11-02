@@ -5,6 +5,7 @@ import secrets
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from workers.bilibili.api import neon_store
 
 app = FastAPI(
     title="Database-Bilibili API",
@@ -84,6 +85,11 @@ def get_channel_videos(uid: str) -> list[dict]:
     if not UID_PATTERN.fullmatch(uid):
         raise HTTPException(400, "Invalid channel UID")
 
+    if neon_store.enabled():
+        return neon_store.get_channel_videos(
+            uid, format_duration
+        )
+
     folder = DATA_ROOT / uid
 
     source = read_jsonl(folder / "all_videos.jsonl")
@@ -151,8 +157,23 @@ def health():
     }
 
 
+@app.get("/ready")
+def ready():
+    if not neon_store.enabled():
+        raise HTTPException(503, "Database not configured")
+
+    neon_store.check_ready()
+    return {"success": True, "status": "ready"}
+
+
 @app.get("/v1/channels", dependencies=[Depends(require_api_key)])
 def list_channels():
+    if neon_store.enabled():
+        return {
+            "success": True,
+            "channels": neon_store.list_channels(),
+        }
+
     if not DATA_ROOT.is_dir():
         return {"success": True, "channels": []}
 
@@ -270,6 +291,14 @@ def list_videos(
 def get_video(bvid: str):
     if not BVID_PATTERN.fullmatch(bvid):
         raise HTTPException(400, "Invalid BVID")
+
+    if neon_store.enabled():
+        video = neon_store.get_video(bvid, format_duration)
+
+        if video is None:
+            raise HTTPException(404, "Video not found")
+
+        return {"success": True, "video": video}
 
     if not DATA_ROOT.is_dir():
         raise HTTPException(404, "Video not found")
