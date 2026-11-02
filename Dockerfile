@@ -19,4 +19,4 @@ USER 10001:10001
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "exec uvicorn workers.bilibili.api.main:app --host 0.0.0.0 --port ${PORT} --loop uvloop --http httptools"]
+CMD ["sh", "-c", "exec uvicorn workers.bilibili.api.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --loop uvloop --http httptools"]
