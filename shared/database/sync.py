@@ -15,9 +15,10 @@ from typing import Optional, List, Dict, Any, Generator
 from contextlib import contextmanager
 
 import psycopg
+from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
-from .models import SyncStatus, SyncState
+from .models import SyncStatus, SyncState, DatabaseRole
 from .manager import get_database_manager
 
 logger = logging.getLogger(__name__)
@@ -51,16 +52,31 @@ class OutboxSync:
         if self._manager._standby_pool:
             self._create_outbox_table(self._manager._standby_pool, "standby")
 
-    def _create_outbox_table(self, pool: Optional[psycopg.pool.ThreadedConnectionPool], db_name: str) -> None:
+    def _get_connection(self, pool: ConnectionPool) -> psycopg.Connection:
+        """Get a connection from pool."""
+        conn = pool.getconn()
+        conn.autocommit = False
+        return conn
+
+    def _put_connection(self, pool: ConnectionPool, conn: psycopg.Connection) -> None:
+        """Return connection to pool."""
+        try:
+            pool.putconn(conn)
+        except Exception:
+            pass
+
+    def _create_outbox_table(self, pool: ConnectionPool, db_name: str) -> None:
         """Create outbox and checkpoint tables."""
         if not pool:
             return
 
+        conn = None
         try:
-            with pool.connection() as conn:
+            conn = self._get_connection(pool)
+            with conn.cursor() as cur:
                 with conn.transaction():
                     # Outbox table for capturing changes
-                    conn.execute(f"""
+                    cur.execute(f"""
                         CREATE TABLE IF NOT EXISTS {self.OUTBOX_TABLE} (
                             id BIGSERIAL PRIMARY KEY,
                             table_name TEXT NOT NULL,
@@ -74,14 +90,14 @@ class OutboxSync:
                     """)
 
                     # Index for efficient polling
-                    conn.execute(f"""
+                    cur.execute(f"""
                         CREATE INDEX IF NOT EXISTS idx_{self.OUTBOX_TABLE}_unprocessed
                         ON {self.OUTBOX_TABLE} (created_at)
                         WHERE processed_at IS NULL
                     """)
 
                     # Checkpoint table for tracking replication progress
-                    conn.execute(f"""
+                    cur.execute(f"""
                         CREATE TABLE IF NOT EXISTS {self.CHECKPOINT_TABLE} (
                             id INTEGER PRIMARY KEY DEFAULT 1,
                             last_processed_id BIGINT NOT NULL DEFAULT 0,
@@ -92,7 +108,7 @@ class OutboxSync:
                     """)
 
                     # Initialize checkpoint
-                    conn.execute(f"""
+                    cur.execute(f"""
                         INSERT INTO {self.CHECKPOINT_TABLE} (id, last_processed_id)
                         VALUES (1, 0)
                         ON CONFLICT (id) DO NOTHING
@@ -102,6 +118,9 @@ class OutboxSync:
         except Exception as e:
             logger.error(f"Failed to initialize outbox schema on {db_name}: {e}")
             raise
+        finally:
+            if conn:
+                self._put_connection(pool, conn)
 
     def record_change(
         self,
@@ -135,13 +154,14 @@ class OutboxSync:
         payload: Dict[str, Any]
     ) -> None:
         """Insert a record into the outbox table."""
-        conn.execute(
-            f"""
-            INSERT INTO {self.OUTBOX_TABLE} (table_name, operation, payload)
-            VALUES (%s, %s, %s)
-            """,
-            (table_name, operation, psycopg.types.json.Json(payload))
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {self.OUTBOX_TABLE} (table_name, operation, payload)
+                VALUES (%s, %s, %s)
+                """,
+                (table_name, operation, psycopg.types.json.Json(payload))
+            )
 
     def sync_once(self) -> Dict[str, Any]:
         """
@@ -175,17 +195,23 @@ class OutboxSync:
         """Replicate unprocessed changes from primary to standby."""
         last_processed_id = self._get_last_processed_id()
 
-        with self._manager._primary_pool.connection() as src_conn:
-            rows = src_conn.execute(
-                f"""
-                SELECT id, table_name, operation, payload
-                FROM {self.OUTBOX_TABLE}
-                WHERE id > %s AND processed_at IS NULL
-                ORDER BY id
-                LIMIT %s
-                """,
-                (last_processed_id, self._batch_size)
-            ).fetchall()
+        primary_pool = self._manager._primary_pool
+        src_conn = self._get_connection(primary_pool)
+        try:
+            with src_conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, table_name, operation, payload
+                    FROM {self.OUTBOX_TABLE}
+                    WHERE id > %s AND processed_at IS NULL
+                    ORDER BY id
+                    LIMIT %s
+                    """,
+                    (last_processed_id, self._batch_size)
+                )
+                rows = cur.fetchall()
+        finally:
+            self._put_connection(primary_pool, src_conn)
 
         if not rows:
             return 0
@@ -208,10 +234,16 @@ class OutboxSync:
         if not self._manager._standby_pool:
             return 0
 
-        with self._manager._standby_pool.connection() as conn:
-            row = conn.execute(
-                f"SELECT last_processed_id FROM {self.CHECKPOINT_TABLE} WHERE id = 1"
-            ).fetchone()
+        standby_pool = self._manager._standby_pool
+        conn = self._get_connection(standby_pool)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT last_processed_id FROM {self.CHECKPOINT_TABLE} WHERE id = 1"
+                )
+                row = cur.fetchone()
+        finally:
+            self._put_connection(standby_pool, conn)
 
         return row["last_processed_id"] if row else 0
 
@@ -224,7 +256,9 @@ class OutboxSync:
         if not self._manager._standby_pool:
             raise RuntimeError("No standby pool")
 
-        with self._manager._standby_pool.connection() as conn:
+        standby_pool = self._manager._standby_pool
+        conn = self._get_connection(standby_pool)
+        try:
             with conn.transaction():
                 if operation == "INSERT":
                     self._apply_insert(conn, table_name, payload)
@@ -232,6 +266,8 @@ class OutboxSync:
                     self._apply_update(conn, table_name, payload)
                 elif operation == "DELETE":
                     self._apply_delete(conn, table_name, payload)
+        finally:
+            self._put_connection(standby_pool, conn)
 
     def _apply_insert(self, conn: psycopg.Connection, table: str, payload: Dict) -> None:
         """Apply INSERT operation with conflict handling."""
@@ -245,26 +281,29 @@ class OutboxSync:
             conflict_cols = ", ".join(pk_columns)
             update_cols = ", ".join([f"{c} = EXCLUDED.{c}" for c in columns if c not in pk_columns])
             if update_cols:
-                conn.execute(
-                    f"""
-                    INSERT INTO {table} ({column_list}) VALUES ({placeholders})
-                    ON CONFLICT ({conflict_cols}) DO UPDATE SET {update_cols}
-                    """,
-                    tuple(payload.values())
-                )
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {table} ({column_list}) VALUES ({placeholders})
+                        ON CONFLICT ({conflict_cols}) DO UPDATE SET {update_cols}
+                        """,
+                        tuple(payload.values())
+                    )
             else:
-                conn.execute(
-                    f"""
-                    INSERT INTO {table} ({column_list}) VALUES ({placeholders})
-                    ON CONFLICT ({conflict_cols}) DO NOTHING
-                    """,
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {table} ({column_list}) VALUES ({placeholders})
+                        ON CONFLICT ({conflict_cols}) DO NOTHING
+                        """,
+                        tuple(payload.values())
+                    )
+        else:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})",
                     tuple(payload.values())
                 )
-        else:
-            conn.execute(
-                f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})",
-                tuple(payload.values())
-            )
 
     def _apply_update(self, conn: psycopg.Connection, table: str, payload: Dict) -> None:
         """Apply UPDATE operation."""
@@ -281,10 +320,11 @@ class OutboxSync:
         set_clause = ", ".join([f"{k} = %s" for k in update_columns])
         where_clause = " AND ".join([f"{k} = %s" for k in pk_columns])
 
-        conn.execute(
-            f"UPDATE {table} SET {set_clause} WHERE {where_clause}",
-            tuple(update_columns.values()) + tuple(pk_values.values())
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {table} SET {set_clause} WHERE {where_clause}",
+                tuple(update_columns.values()) + tuple(pk_values.values())
+            )
 
     def _apply_delete(self, conn: psycopg.Connection, table: str, payload: Dict) -> None:
         """Apply DELETE operation."""
@@ -295,48 +335,61 @@ class OutboxSync:
         pk_values = {k: payload[k] for k in pk_columns}
         where_clause = " AND ".join([f"{k} = %s" for k in pk_columns])
 
-        conn.execute(
-            f"DELETE FROM {table} WHERE {where_clause}",
-            tuple(pk_values.values())
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {table} WHERE {where_clause}",
+                tuple(pk_values.values())
+            )
 
     def _get_primary_key_columns(self, conn: psycopg.Connection, table: str) -> List[str]:
         """Get primary key columns for a table."""
-        row = conn.execute(
-            """
-            SELECT a.attname
-            FROM pg_index i
-            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-            WHERE i.indrelid = %s::regclass AND i.indisprimary
-            """,
-            (table,)
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.attname
+                FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                WHERE i.indrelid = %s::regclass AND i.indisprimary
+                """,
+                (table,)
+            )
+            rows = cur.fetchall()
 
-        return [r["attname"] for r in row] if row else []
+        return [r["attname"] for r in rows] if rows else []
 
     def _mark_processed(self, outbox_id: int) -> None:
         """Mark an outbox entry as processed on primary."""
-        with self._manager._primary_pool.connection() as conn:
-            conn.execute(
-                f"""
-                UPDATE {self.OUTBOX_TABLE}
-                SET processed_at = NOW()
-                WHERE id = %s
-                """,
-                (outbox_id,)
-            )
+        primary_pool = self._manager._primary_pool
+        conn = self._get_connection(primary_pool)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.OUTBOX_TABLE}
+                    SET processed_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (outbox_id,)
+                )
+        finally:
+            self._put_connection(primary_pool, conn)
 
     def _record_retry(self, outbox_id: int, error: str) -> None:
         """Record a retry attempt for a failed outbox entry."""
-        with self._manager._primary_pool.connection() as conn:
-            conn.execute(
-                f"""
-                UPDATE {self.OUTBOX_TABLE}
-                SET retry_count = retry_count + 1, last_error = %s
-                WHERE id = %s
-                """,
-                (error, outbox_id)
-            )
+        primary_pool = self._manager._primary_pool
+        conn = self._get_connection(primary_pool)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.OUTBOX_TABLE}
+                    SET retry_count = retry_count + 1, last_error = %s
+                    WHERE id = %s
+                    """,
+                    (error, outbox_id)
+                )
+        finally:
+            self._put_connection(primary_pool, conn)
 
     def _update_checkpoint(self) -> None:
         """Update the checkpoint on standby with last processed ID."""
@@ -345,24 +398,35 @@ class OutboxSync:
 
         last_id = self._get_last_processed_id_from_primary()
 
-        with self._manager._standby_pool.connection() as conn:
-            conn.execute(
-                f"""
-                UPDATE {self.CHECKPOINT_TABLE}
-                SET last_processed_id = %s,
-                    last_processed_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = 1
-                """,
-                (last_id,)
-            )
+        standby_pool = self._manager._standby_pool
+        conn = self._get_connection(standby_pool)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.CHECKPOINT_TABLE}
+                    SET last_processed_id = %s,
+                        last_processed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = 1
+                    """,
+                    (last_id,)
+                )
+        finally:
+            self._put_connection(standby_pool, conn)
 
     def _get_last_processed_id_from_primary(self) -> int:
         """Get the maximum processed ID from primary."""
-        with self._manager._primary_pool.connection() as conn:
-            row = conn.execute(
-                f"SELECT COALESCE(MAX(id), 0) as max_id FROM {self.OUTBOX_TABLE} WHERE processed_at IS NOT NULL"
-            ).fetchone()
+        primary_pool = self._manager._primary_pool
+        conn = self._get_connection(primary_pool)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT COALESCE(MAX(id), 0) as max_id FROM {self.OUTBOX_TABLE} WHERE processed_at IS NOT NULL"
+                )
+                row = cur.fetchone()
+        finally:
+            self._put_connection(primary_pool, conn)
 
         return row["max_id"] if row else 0
 
@@ -371,29 +435,40 @@ class OutboxSync:
         if not self._manager._primary_pool or not self._manager._standby_pool:
             return
 
-        with self._manager._primary_pool.connection() as src_conn:
-            src_row = src_conn.execute(
-                f"SELECT COALESCE(MAX(created_at), NOW()) as max_created FROM {self.OUTBOX_TABLE}"
-            ).fetchone()
+        primary_pool = self._manager._primary_pool
+        standby_pool = self._manager._standby_pool
 
-        with self._manager._standby_pool.connection() as dst_conn:
-            dst_row = dst_conn.execute(
-                f"SELECT last_processed_at FROM {self.CHECKPOINT_TABLE} WHERE id = 1"
-            ).fetchone()
-
-        if src_row and dst_row and src_row["max_created"] and dst_row["last_processed_at"]:
-            lag = (src_row["max_created"] - dst_row["last_processed_at"]).total_seconds()
-            self._manager.update_sync_state(lag_seconds=max(0, lag))
-
-            with self._manager._standby_pool.connection() as conn:
-                conn.execute(
-                    f"""
-                    UPDATE {self.CHECKPOINT_TABLE}
-                    SET lag_seconds = %s
-                    WHERE id = 1
-                    """,
-                    (lag,)
+        src_conn = self._get_connection(primary_pool)
+        dst_conn = self._get_connection(standby_pool)
+        try:
+            with src_conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT COALESCE(MAX(created_at), NOW()) as max_created FROM {self.OUTBOX_TABLE}"
                 )
+                src_row = cur.fetchone()
+
+            with dst_conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT last_processed_at FROM {self.CHECKPOINT_TABLE} WHERE id = 1"
+                )
+                dst_row = cur.fetchone()
+
+            if src_row and dst_row and src_row["max_created"] and dst_row["last_processed_at"]:
+                lag = (src_row["max_created"] - dst_row["last_processed_at"]).total_seconds()
+                self._manager.update_sync_state(lag_seconds=max(0, lag))
+
+                with dst_conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        UPDATE {self.CHECKPOINT_TABLE}
+                        SET lag_seconds = %s
+                        WHERE id = 1
+                        """,
+                        (lag,)
+                    )
+        finally:
+            self._put_connection(primary_pool, src_conn)
+            self._put_connection(standby_pool, dst_conn)
 
     def start_background_sync(self) -> None:
         """Start background synchronization thread."""
@@ -433,20 +508,32 @@ class OutboxSync:
         lag = None
 
         if self._manager._primary_pool:
-            with self._manager._primary_pool.connection() as conn:
-                row = conn.execute(
-                    f"SELECT COUNT(*) as cnt FROM {self.OUTBOX_TABLE} WHERE processed_at IS NULL"
-                ).fetchone()
-                primary_pending = row["cnt"] if row else 0
+            primary_pool = self._manager._primary_pool
+            conn = self._get_connection(primary_pool)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT COUNT(*) as cnt FROM {self.OUTBOX_TABLE} WHERE processed_at IS NULL"
+                    )
+                    row = cur.fetchone()
+                    primary_pending = row["cnt"] if row else 0
+            finally:
+                self._put_connection(primary_pool, conn)
 
         if self._manager._standby_pool:
-            with self._manager._standby_pool.connection() as conn:
-                row = conn.execute(
-                    f"SELECT last_processed_id, lag_seconds FROM {self.CHECKPOINT_TABLE} WHERE id = 1"
-                ).fetchone()
-                if row:
-                    standby_checkpoint = row["last_processed_id"]
-                    lag = row["lag_seconds"]
+            standby_pool = self._manager._standby_pool
+            conn = self._get_connection(standby_pool)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT last_processed_id, lag_seconds FROM {self.CHECKPOINT_TABLE} WHERE id = 1"
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        standby_checkpoint = row["last_processed_id"]
+                        lag = row["lag_seconds"]
+            finally:
+                self._put_connection(standby_pool, conn)
 
         return {
             "primary_pending_changes": primary_pending,
@@ -464,7 +551,7 @@ class ChangeLogSync:
     (if available on Neon) or trigger-based change capture.
 
     Note: Neon Free tier may not support logical replication slots.
-    This is a fallback for when outbox pattern is not suitable.
+    This is a placeholder for future enhancement.
     """
 
     def __init__(self, manager: Optional["DatabaseManager"] = None) -> None:

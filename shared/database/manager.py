@@ -30,6 +30,47 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
+class _PooledConnection:
+    """Wrapper to provide psycopg 3 compatible interface for pooled connections."""
+    
+    def __init__(self, pool: ThreadedConnectionPool, conn: psycopg.Connection):
+        self._pool = pool
+        self._conn = conn
+    
+    def __enter__(self) -> psycopg.Connection:
+        return self._conn
+    
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        try:
+            if exc_type is not None:
+                self._conn.rollback()
+            else:
+                self._conn.commit()
+        finally:
+            self._pool.putconn(self._conn)
+    
+    def cursor(self, **kwargs):
+        return self._conn.cursor(**kwargs)
+    
+    def execute(self, query: str, params: tuple = ()):
+        with self._conn.cursor() as cur:
+            return cur.execute(query, params)
+    
+    def fetchall(self):
+        with self._conn.cursor() as cur:
+            return cur.fetchall()
+    
+    def fetchone(self):
+        with self._conn.cursor() as cur:
+            return cur.fetchone()
+    
+    def rollback(self):
+        self._conn.rollback()
+    
+    def commit(self):
+        self._conn.commit()
+
+
 class DatabaseManager:
     """
     Centralized database connection manager with automatic failover.
@@ -133,8 +174,14 @@ class DatabaseManager:
             max_size=config.pool_max_size,
             dsn=config.url,
             connect_timeout=config.connect_timeout,
-            row_factory=dict_row,
+            kwargs={"row_factory": dict_row},
         )
+
+    def _get_connection(self, pool: ThreadedConnectionPool) -> psycopg.Connection:
+        """Get a connection from pool with proper configuration."""
+        conn = pool.getconn()
+        conn.autocommit = False
+        return conn
 
     def _determine_initial_active(self) -> None:
         """Determine which database should be active initially."""
@@ -157,9 +204,11 @@ class DatabaseManager:
         if not pool:
             return False
 
+        conn = None
         try:
-            with pool.connection() as conn:
-                conn.execute("SELECT 1")
+            conn = self._get_connection(pool)
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
             state.status = DatabaseStatus.HEALTHY
             state.last_check = datetime.utcnow()
             state.reset_failures()
@@ -170,6 +219,12 @@ class DatabaseManager:
             state.record_failure(str(e))
             logger.warning(f"Health check failed for {state.config.role.value}: {e}")
             return False
+        finally:
+            if conn:
+                try:
+                    pool.putconn(conn)
+                except Exception:
+                    pass
 
     @property
     def active_role(self) -> DatabaseRole:
@@ -220,9 +275,8 @@ class DatabaseManager:
         if not pool or not state:
             raise RuntimeError("No active database available")
 
-        conn = None
+        conn = self._get_connection(pool)
         try:
-            conn = pool.getconn()
             yield conn
             state.record_success()
         except psycopg.Error as e:
@@ -231,11 +285,10 @@ class DatabaseManager:
             self._handle_connection_failure(state, e)
             raise
         finally:
-            if conn:
-                try:
-                    pool.putconn(conn)
-                except Exception:
-                    pass
+            try:
+                pool.putconn(conn)
+            except Exception:
+                pass
 
     @contextmanager
     def transaction(self) -> Generator[psycopg.Connection, None, None]:
@@ -551,11 +604,11 @@ class DatabaseManager:
         self._shutdown = True
 
         if self._primary_pool:
-            self._primary_pool.closeall()
+            self._primary_pool.close()
             self._primary_pool = None
 
         if self._standby_pool:
-            self._standby_pool.closeall()
+            self._standby_pool.close()
             self._standby_pool = None
 
         logger.info("Database manager shutdown complete")

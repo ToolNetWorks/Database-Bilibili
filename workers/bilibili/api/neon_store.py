@@ -25,9 +25,9 @@ def _execute_query(sql: str, params: tuple = ()) -> List[Dict]:
 
     try:
         with manager.connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql, params)
-                return cursor.fetchall()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchall()
     except Exception as e:
         raise HTTPException(503, f"Database temporarily unavailable: {e}") from None
 

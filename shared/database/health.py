@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
 import psycopg
-from psycopg.pool import ThreadedConnectionPool
+from psycopg_pool import ConnectionPool
 
 from .models import DatabaseStatus, DatabaseState, SyncStatus
 from .manager import get_database_manager
@@ -110,10 +110,23 @@ class HealthMonitor:
         self._evaluate_alerts(results)
         return results
 
+    def _get_connection(self, pool: ConnectionPool) -> psycopg.Connection:
+        """Get a connection from pool."""
+        conn = pool.getconn()
+        conn.autocommit = False
+        return conn
+
+    def _put_connection(self, pool: ConnectionPool, conn: psycopg.Connection) -> None:
+        """Return connection to pool."""
+        try:
+            pool.putconn(conn)
+        except Exception:
+            pass
+
     def _check_database(
         self,
         state: DatabaseState,
-        pool: ThreadedConnectionPool,
+        pool: ConnectionPool,
         role: str
     ) -> HealthCheckResult:
         """Check health of a single database."""
@@ -122,13 +135,15 @@ class HealthMonitor:
         healthy = False
         details = {}
 
+        conn = None
         try:
-            with pool.connection() as conn:
+            conn = self._get_connection(pool)
+            with conn.cursor() as cur:
                 # Basic connectivity
-                conn.execute("SELECT 1")
+                cur.execute("SELECT 1")
 
                 # Get database stats
-                stats = self._get_database_stats(conn)
+                stats = self._get_database_stats(cur)
                 details.update(stats)
 
                 # Check pool status
@@ -148,6 +163,9 @@ class HealthMonitor:
             state.record_failure(error)
             state.status = DatabaseStatus.UNAVAILABLE if state.consecutive_failures >= self._max_consecutive_failures else DatabaseStatus.DEGRADED
             logger.warning(f"Health check failed for {role}: {error}")
+        finally:
+            if conn:
+                self._put_connection(pool, conn)
 
         result = HealthCheckResult(
             database_role=role,
@@ -160,27 +178,29 @@ class HealthMonitor:
         self._add_to_history(result)
         return result
 
-    def _get_database_stats(self, conn: psycopg.Connection) -> Dict[str, Any]:
+    def _get_database_stats(self, cur: psycopg.Cursor) -> Dict[str, Any]:
         """Get database statistics."""
         stats = {}
 
         try:
             # Database size
-            row = conn.execute(
+            cur.execute(
                 "SELECT pg_size_pretty(pg_database_size(current_database())) as size"
-            ).fetchone()
+            )
+            row = cur.fetchone()
             if row:
                 stats["database_size"] = row["size"]
 
             # Active connections
-            row = conn.execute(
+            cur.execute(
                 "SELECT count(*) as count FROM pg_stat_activity WHERE datname = current_database()"
-            ).fetchone()
+            )
+            row = cur.fetchone()
             if row:
                 stats["active_connections"] = row["count"]
 
             # Transaction stats
-            row = conn.execute(
+            cur.execute(
                 """
                 SELECT xact_commit, xact_rollback,
                        blks_read, blks_hit,
@@ -189,7 +209,8 @@ class HealthMonitor:
                 FROM pg_stat_database
                 WHERE datname = current_database()
                 """
-            ).fetchone()
+            )
+            row = cur.fetchone()
             if row:
                 stats.update(dict(row))
 
@@ -198,9 +219,9 @@ class HealthMonitor:
 
         return stats
 
-    def _get_pool_stats(self, pool: ThreadedConnectionPool) -> Dict[str, Any]:
+    def _get_pool_stats(self, pool: ConnectionPool) -> Dict[str, Any]:
         """Get connection pool statistics."""
-        # ThreadedConnectionPool doesn't expose detailed stats
+        # ConnectionPool doesn't expose detailed stats
         # We track what we can in DatabaseState
         return {}
 
