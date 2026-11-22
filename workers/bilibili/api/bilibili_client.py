@@ -71,13 +71,14 @@ class BilibiliClient:
         # Extract from URL
         patterns = [
             r"space\.bilibili\.com/(\d+)",
+            r"m\.bilibili\.com/space/(\d+)",
             r"b23\.tv/.*",
         ]
 
         for pattern in patterns:
             match = re.search(pattern, url_or_uid)
-            if match:
-                return match.group(1) if match.lastindex else None
+            if match and match.lastindex:
+                return match.group(1)
 
         # Try to resolve b23.tv short URL
         if "b23.tv" in url_or_uid:
@@ -85,7 +86,7 @@ class BilibiliClient:
                 req = urllib.request.Request(url_or_uid, headers=DEFAULT_HEADERS, method="HEAD")
                 with urllib.request.urlopen(req, timeout=self.timeout) as response:
                     final_url = response.geturl()
-                    match = re.search(r"space\.bilibili\.com/(\d+)", final_url)
+                    match = re.search(r"(?:space|m\.bilibili\.com/space)/(\d+)", final_url)
                     if match:
                         return match.group(1)
             except Exception:
