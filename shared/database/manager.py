@@ -14,7 +14,7 @@ from typing import Optional, Any, Generator, List, Dict
 from urllib.parse import urlparse
 
 import psycopg
-from psycopg_pool import ThreadedConnectionPool
+from psycopg.pool import ThreadedConnectionPool
 from psycopg.rows import dict_row
 
 from .models import (
