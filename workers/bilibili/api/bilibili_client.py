@@ -14,12 +14,21 @@ from typing import Optional, Dict, List, Any
 
 BILIBILI_API_BASE = "https://api.bilibili.com"
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+DESKTOP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://www.bilibili.com/",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
+
+MOBILE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+    "Referer": "https://m.bilibili.com/",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+DEFAULT_HEADERS = MOBILE_HEADERS
 
 UID_PATTERN = re.compile(r"^[0-9]{1,20}$")
 BVID_PATTERN = re.compile(r"^BV[A-Za-z0-9]{10}$")
@@ -33,11 +42,13 @@ class BilibiliClient:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
 
-    def _request(self, url: str) -> Optional[Dict[str, Any]]:
+    def _request(self, url: str, headers: dict = None) -> Optional[Dict[str, Any]]:
         """Make HTTP GET request with retry logic."""
+        if headers is None:
+            headers = DEFAULT_HEADERS
         for attempt in range(self.max_retries):
             try:
-                req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
+                req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=self.timeout) as response:
                     data = json.loads(response.read().decode("utf-8"))
                     if data.get("code") == 0:
@@ -87,20 +98,44 @@ class BilibiliClient:
         if not UID_PATTERN.fullmatch(uid):
             return None
 
+        # Try acc/info with desktop UA first
         url = f"{BILIBILI_API_BASE}/x/space/acc/info?mid={uid}"
-        data = self._request(url)
+        data = self._request(url, headers=DESKTOP_HEADERS)
 
-        if not data:
-            return None
+        if data and data.get("name"):
+            return {
+                "uid": uid,
+                "name": data.get("name"),
+                "source_url": f"https://space.bilibili.com/{uid}",
+                "face": data.get("face"),
+                "sign": data.get("sign"),
+                "level": data.get("level"),
+            }
 
-        return {
-            "uid": uid,
-            "name": data.get("name"),
-            "source_url": f"https://space.bilibili.com/{uid}",
-            "face": data.get("face"),
-            "sign": data.get("sign"),
-            "level": data.get("level"),
-        }
+        # Fallback: get channel name from arc/search
+        search_result = self.get_channel_videos(uid, page=1, page_size=1)
+        if search_result.get("total", 0) > 0:
+            # We got results, channel exists
+            # Try to get name from first video's author
+            # Re-fetch with full data
+            url2 = f"{BILIBILI_API_BASE}/x/space/arc/search?mid={uid}&ps=1&tid=0&pn=1&keyword=&order=pubdate&platform=web"
+            data2 = self._request(url2, headers=MOBILE_HEADERS)
+            name = None
+            if data2:
+                vl = data2.get("list", {}).get("vlist", [])
+                if vl:
+                    name = vl[0].get("author")
+
+            return {
+                "uid": uid,
+                "name": name or f"Channel {uid}",
+                "source_url": f"https://space.bilibili.com/{uid}",
+                "face": None,
+                "sign": None,
+                "level": None,
+            }
+
+        return None
 
     def get_channel_videos(
         self,
@@ -122,7 +157,7 @@ class BilibiliClient:
             f"&keyword=&order={order}&platform=web"
         )
 
-        data = self._request(url)
+        data = self._request(url, headers=MOBILE_HEADERS)
 
         if not data:
             return {"videos": [], "total": 0}
@@ -130,47 +165,76 @@ class BilibiliClient:
         video_list = data.get("list", {}).get("vlist", [])
         total = data.get("page", {}).get("count", 0)
 
-        bvids = []
+        videos = []
         seen = set()
         for video in video_list:
             bvid = video.get("bvid")
-            if bvid and bvid not in seen:
-                seen.add(bvid)
-                bvids.append(bvid)
+            if not bvid or bvid in seen:
+                continue
+            seen.add(bvid)
 
-        return {"videos": bvids, "total": total}
+            # Parse duration from "MM:SS" or "HH:MM:SS" format
+            duration_seconds = None
+            length = video.get("length", "")
+            if length:
+                parts = length.split(":")
+                try:
+                    if len(parts) == 2:
+                        duration_seconds = int(parts[0]) * 60 + int(parts[1])
+                    elif len(parts) == 3:
+                        duration_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                except (ValueError, IndexError):
+                    pass
+
+            videos.append({
+                "bvid": bvid,
+                "aid": video.get("aid"),
+                "title": video.get("title"),
+                "thumbnail": video.get("pic"),
+                "description": video.get("description"),
+                "duration_seconds": duration_seconds,
+                "published_at": video.get("created"),
+                "views": video.get("play"),
+                "channel_uid": str(video.get("mid", "")),
+                "channel_name": video.get("author"),
+                "url": f"https://www.bilibili.com/video/{bvid}",
+            })
+
+        return {"videos": videos, "total": total, "bvids": [v["bvid"] for v in videos]}
 
     def get_all_channel_videos(
         self,
         uid: str,
         page_size: int = 30,
         max_pages: int = 100,
-    ) -> List[str]:
-        """Get all video BVIDs for a channel by paginating."""
-        all_bvids = []
+        fetch_metadata: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Get all videos for a channel by paginating. Returns full metadata."""
+        all_videos = []
         seen = set()
         page = 1
 
         while page <= max_pages:
             result = self.get_channel_videos(uid, page=page, page_size=page_size)
-            bvids = result.get("videos", [])
+            videos = result.get("videos", [])
 
-            if not bvids:
+            if not videos:
                 break
 
-            for bvid in bvids:
+            for video in videos:
+                bvid = video["bvid"]
                 if bvid not in seen:
                     seen.add(bvid)
-                    all_bvids.append(bvid)
+                    all_videos.append(video)
 
             total = result.get("total", 0)
-            if len(all_bvids) >= total:
+            if len(all_videos) >= total:
                 break
 
             page += 1
             time.sleep(0.5)  # Rate limiting
 
-        return all_bvids
+        return all_videos
 
     def _classify_status(self, data: dict, rights: dict) -> str:
         """Classify video access status using existing logic."""
@@ -199,7 +263,7 @@ class BilibiliClient:
             return None
 
         url = f"{BILIBILI_API_BASE}/x/web-interface/view?bvid={bvid}"
-        data = self._request(url)
+        data = self._request(url, headers=DESKTOP_HEADERS)
 
         if not data:
             return None

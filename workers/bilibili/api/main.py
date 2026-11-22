@@ -457,10 +457,10 @@ def scan_channel(
     if not channel_info or not channel_info.get("name"):
         raise HTTPException(404, "Channel not found on Bilibili")
 
-    # Get all video BVIDs
-    bvids = bilibili_client.get_all_channel_videos(uid, max_pages=max_pages)
+    # Get all videos with metadata from arc/search
+    all_videos = bilibili_client.get_all_channel_videos(uid, max_pages=max_pages)
 
-    if not bvids:
+    if not all_videos:
         return {
             "success": True,
             "uid": uid,
@@ -470,67 +470,51 @@ def scan_channel(
             "message": "No videos found",
         }
 
-    # Fetch metadata if requested
     videos = []
     seen = set()
 
-    for bvid in bvids:
+    for info in all_videos:
+        bvid = info["bvid"]
         if bvid in seen:
             continue
         seen.add(bvid)
 
-        if fetch_metadata:
-            info = bilibili_client.get_video_info(bvid)
-            if info:
-                video = {
-                    "bvid": bvid,
-                    "channel_uid": uid,
-                    "url": f"https://www.bilibili.com/video/{bvid}",
-                    "title": info.get("title"),
-                    "thumbnail": info.get("thumbnail"),
-                    "description": info.get("description"),
-                    "duration_seconds": info.get("duration_seconds"),
-                    "duration_display": format_duration(info.get("duration_seconds")),
-                    "published_at": info.get("published_at"),
-                    "views": info.get("views"),
-                    "aid": info.get("aid"),
-                    "cid": info.get("cid"),
-                    "status": info.get("status", "UNKNOWN"),
-                    "rights": info.get("rights", {}),
-                    "is_upower_exclusive": info.get("is_upower_exclusive"),
-                    "is_upower_preview": info.get("is_upower_preview"),
-                    "is_upower_play": info.get("is_upower_play"),
-                }
-                videos.append(video)
+        # Classify status using rights
+        status = "UNKNOWN"
+        # arc/search doesn't include rights, so we'll classify based on available data
+        # is_pay field indicates paid content
+        if info.get("is_pay"):
+            status = "PAID"
 
-                # Store in database if available
-                if neon_store.enabled():
-                    try:
-                        neon_store.upsert_channel(uid, channel_info.get("name"), f"https://space.bilibili.com/{uid}", len(bvids))
-                        neon_store.upsert_video(video)
-                    except Exception:
-                        pass  # Don't fail scan if DB write fails
-            else:
-                videos.append({
-                    "bvid": bvid,
-                    "channel_uid": uid,
-                    "url": f"https://www.bilibili.com/video/{bvid}",
-                    "title": None,
-                    "thumbnail": None,
-                    "description": None,
-                    "duration_seconds": None,
-                    "duration_display": None,
-                    "published_at": None,
-                    "views": None,
-                    "aid": None,
-                    "cid": None,
-                    "status": "UNKNOWN",
-                })
+        video = {
+            "bvid": bvid,
+            "channel_uid": uid,
+            "url": f"https://www.bilibili.com/video/{bvid}",
+            "title": info.get("title"),
+            "thumbnail": info.get("thumbnail"),
+            "description": info.get("description"),
+            "duration_seconds": info.get("duration_seconds"),
+            "duration_display": format_duration(info.get("duration_seconds")),
+            "published_at": info.get("published_at"),
+            "views": info.get("views"),
+            "aid": info.get("aid"),
+            "cid": None,
+            "status": status,
+        }
+        videos.append(video)
+
+        # Store in database if available
+        if neon_store.enabled():
+            try:
+                neon_store.upsert_channel(uid, channel_info.get("name"), f"https://space.bilibili.com/{uid}", len(all_videos))
+                neon_store.upsert_video(video)
+            except Exception:
+                pass  # Don't fail scan if DB write fails
 
     # Update channel in DB
     if neon_store.enabled():
         try:
-            neon_store.upsert_channel(uid, channel_info.get("name"), f"https://space.bilibili.com/{uid}", len(bvids))
+            neon_store.upsert_channel(uid, channel_info.get("name"), f"https://space.bilibili.com/{uid}", len(all_videos))
         except Exception:
             pass
 
