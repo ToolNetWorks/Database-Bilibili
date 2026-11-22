@@ -13,7 +13,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 
-MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
 
 
 def get_database_urls() -> dict:

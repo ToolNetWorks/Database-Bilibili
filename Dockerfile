@@ -12,7 +12,7 @@ COPY shared/database ./shared/database
 RUN pip install --no-cache-dir \
     -r requirements-api.txt
 
-COPY workers/bilibili/api/main.py workers/bilibili/api/neon_store.py workers/bilibili/api/docs_api.py ./workers/bilibili/api/
+COPY workers/bilibili/api/main.py workers/bilibili/api/neon_store.py workers/bilibili/api/docs_api.py workers/bilibili/api/bilibili_client.py ./workers/bilibili/api/
 
 RUN python -m compileall -q workers/bilibili/api
 
