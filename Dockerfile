@@ -7,6 +7,7 @@ ENV PORT=10000
 WORKDIR /app
 
 COPY requirements-api.txt .
+COPY shared/database ./shared/database
 
 RUN pip install --no-cache-dir \
     -r requirements-api.txt

@@ -7,11 +7,15 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Security
 from fastapi.security import APIKeyHeader
 from workers.bilibili.api import neon_store
+from shared.database.endpoints import router as database_internal_router
 
 app = FastAPI(
     title="Database-Bilibili API",
     version="0.1.0",
 )
+
+# Include internal database monitoring endpoints
+app.include_router(database_internal_router)
 
 DATA_ROOT = Path(
     os.getenv(

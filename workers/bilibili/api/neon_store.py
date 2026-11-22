@@ -1,42 +1,46 @@
-import os
+"""
+Neon Database Store - Updated to use Database Manager.
 
-import psycopg
+Provides database access through the centralized Database Manager
+with automatic failover and connection pooling.
+"""
+
+import os
+from typing import List, Dict, Optional
+
 from fastapi import HTTPException
-from psycopg.rows import dict_row
+from shared.database.manager import get_database_manager
 
 
 def enabled() -> bool:
-    return bool(os.getenv("DATABASE_URL", "").strip())
+    """Check if database is configured."""
+    primary_url = os.getenv("DATABASE_PRIMARY_URL", "").strip()
+    fallback_url = os.getenv("DATABASE_URL", "").strip()
+    return bool(primary_url or fallback_url)
 
 
-def fetch_all(sql: str, params: tuple = ()) -> list[dict]:
-    database_url = os.getenv("DATABASE_URL", "").strip()
-
-    if not database_url:
-        raise HTTPException(503, "Database not configured")
+def _execute_query(sql: str, params: tuple = ()) -> List[Dict]:
+    """Execute a query using the Database Manager."""
+    manager = get_database_manager()
 
     try:
-        with psycopg.connect(
-            database_url,
-            connect_timeout=10,
-            row_factory=dict_row,
-        ) as conn:
+        with manager.connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(sql, params)
                 return cursor.fetchall()
-    except psycopg.Error:
-        raise HTTPException(
-            503, "Database temporarily unavailable"
-        ) from None
+    except Exception as e:
+        raise HTTPException(503, f"Database temporarily unavailable: {e}") from None
 
 
 def check_ready() -> None:
-    fetch_all("SELECT 1 FROM bilibili_channels LIMIT 1")
-    fetch_all("SELECT 1 FROM bilibili_videos LIMIT 1")
+    """Check if database is ready for queries."""
+    _execute_query("SELECT 1 FROM bilibili_channels LIMIT 1")
+    _execute_query("SELECT 1 FROM bilibili_videos LIMIT 1")
 
 
-def list_channels() -> list[dict]:
-    return fetch_all("""
+def list_channels() -> List[Dict]:
+    """List all channels with video counts."""
+    return _execute_query("""
         SELECT
             c.uid,
             c.name,
@@ -52,7 +56,8 @@ def list_channels() -> list[dict]:
     """)
 
 
-def normalize_video(row: dict, format_duration) -> dict:
+def normalize_video(row: Dict, format_duration) -> Dict:
+    """Normalize video row to API format."""
     seconds = row.get("duration_seconds")
 
     return {
@@ -75,8 +80,9 @@ VIDEO_FIELDS = """
 """
 
 
-def get_channel_videos(uid: str, format_duration) -> list[dict]:
-    rows = fetch_all(
+def get_channel_videos(uid: str, format_duration) -> List[Dict]:
+    """Get all videos for a channel."""
+    rows = _execute_query(
         f"""
         SELECT {VIDEO_FIELDS}
         FROM bilibili_videos
@@ -92,8 +98,9 @@ def get_channel_videos(uid: str, format_duration) -> list[dict]:
     ]
 
 
-def get_video(bvid: str, format_duration) -> dict | None:
-    rows = fetch_all(
+def get_video(bvid: str, format_duration) -> Optional[Dict]:
+    """Get a single video by BVID."""
+    rows = _execute_query(
         f"""
         SELECT {VIDEO_FIELDS}
         FROM bilibili_videos

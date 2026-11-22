@@ -15,8 +15,68 @@ services:
       - key: PORT
         value: "10000"
 
+      # Primary database (required)
+      - key: DATABASE_PRIMARY_URL
+        sync: false
+
+      # Standby database (required for failover)
+      - key: DATABASE_STANDBY_URL
+        sync: false
+
+      # Fallback for backward compatibility
       - key: DATABASE_URL
         sync: false
 
+      # Failover configuration
+      - key: DATABASE_FAILOVER_ENABLED
+        value: "true"
+
+      - key: DATABASE_FAILBACK_MODE
+        value: "manual"
+
+      - key: DATABASE_HEALTH_TIMEOUT
+        value: "5"
+
+      - key: DATABASE_FAILURE_THRESHOLD
+        value: "3"
+
+      # Sync configuration
+      - key: DATABASE_SYNC_ENABLED
+        value: "true"
+
+      - key: DATABASE_SYNC_INTERVAL
+        value: "60"
+
+      - key: DATABASE_SYNC_BATCH_SIZE
+        value: "100"
+
+      - key: DATABASE_MAX_REPLICATION_LAG_SECONDS
+        value: "30"
+
+      # Connection pool configuration
+      - key: DB_POOL_MIN
+        value: "1"
+
+      - key: DB_POOL_MAX
+        value: "5"
+
+      - key: DB_CONNECT_TIMEOUT
+        value: "10"
+
+      - key: DB_COMMAND_TIMEOUT
+        value: "30"
+
+      # Health monitoring
+      - key: DATABASE_HEALTH_CHECK_INTERVAL
+        value: "30"
+
+      - key: DB_ALERT_LATENCY_MS
+        value: "5000"
+
+      # Internal API key for monitoring endpoints
+      - key: INTERNAL_API_KEY
+        sync: false
+
+      # Application API key
       - key: BILIBILI_API_KEY
         sync: false
