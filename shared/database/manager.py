@@ -14,7 +14,7 @@ from typing import Optional, Any, Generator, List, Dict
 from urllib.parse import urlparse
 
 import psycopg
-from psycopg_pool import ThreadedConnectionPool
+from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
 from .models import (
@@ -28,47 +28,6 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class _PooledConnection:
-    """Wrapper to provide psycopg 3 compatible interface for pooled connections."""
-    
-    def __init__(self, pool: ThreadedConnectionPool, conn: psycopg.Connection):
-        self._pool = pool
-        self._conn = conn
-    
-    def __enter__(self) -> psycopg.Connection:
-        return self._conn
-    
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        try:
-            if exc_type is not None:
-                self._conn.rollback()
-            else:
-                self._conn.commit()
-        finally:
-            self._pool.putconn(self._conn)
-    
-    def cursor(self, **kwargs):
-        return self._conn.cursor(**kwargs)
-    
-    def execute(self, query: str, params: tuple = ()):
-        with self._conn.cursor() as cur:
-            return cur.execute(query, params)
-    
-    def fetchall(self):
-        with self._conn.cursor() as cur:
-            return cur.fetchall()
-    
-    def fetchone(self):
-        with self._conn.cursor() as cur:
-            return cur.fetchone()
-    
-    def rollback(self):
-        self._conn.rollback()
-    
-    def commit(self):
-        self._conn.commit()
 
 
 class DatabaseManager:
@@ -101,8 +60,8 @@ class DatabaseManager:
 
         self._primary_state: Optional[DatabaseState] = None
         self._standby_state: Optional[DatabaseState] = None
-        self._primary_pool: Optional[ThreadedConnectionPool] = None
-        self._standby_pool: Optional[ThreadedConnectionPool] = None
+        self._primary_pool: Optional[ConnectionPool] = None
+        self._standby_pool: Optional[ConnectionPool] = None
         self._active_role: DatabaseRole = DatabaseRole.UNKNOWN
         self._sync_state = SyncState()
         self._failover_history: List[FailoverEvent] = []
@@ -167,17 +126,20 @@ class DatabaseManager:
             self._standby_state = DatabaseState(config=self._standby_config)
             self._standby_pool = self._create_pool(self._standby_config)
 
-    def _create_pool(self, config: DatabaseConfig) -> ThreadedConnectionPool:
+    def _create_pool(self, config: DatabaseConfig) -> ConnectionPool:
         """Create a connection pool for the given config."""
-        return ThreadedConnectionPool(
+        return ConnectionPool(
+            conninfo=config.url,
             min_size=config.pool_min_size,
             max_size=config.pool_max_size,
-            dsn=config.url,
-            connect_timeout=config.connect_timeout,
-            kwargs={"row_factory": dict_row},
+            kwargs={
+                "connect_timeout": config.connect_timeout,
+                "row_factory": dict_row,
+            },
+            open=True,
         )
 
-    def _get_connection(self, pool: ThreadedConnectionPool) -> psycopg.Connection:
+    def _get_connection(self, pool: ConnectionPool) -> psycopg.Connection:
         """Get a connection from pool with proper configuration."""
         conn = pool.getconn()
         conn.autocommit = False
@@ -198,7 +160,7 @@ class DatabaseManager:
             logger.error("No healthy database available at startup")
 
     def _check_database_health(
-        self, state: DatabaseState, pool: Optional[ThreadedConnectionPool]
+        self, state: DatabaseState, pool: Optional[ConnectionPool]
     ) -> bool:
         """Check if a database is healthy."""
         if not pool:
@@ -241,7 +203,7 @@ class DatabaseManager:
         """Check if standby is currently active."""
         return self._active_role == DatabaseRole.STANDBY
 
-    def get_active_pool(self) -> Optional[ThreadedConnectionPool]:
+    def get_active_pool(self) -> Optional[ConnectionPool]:
         """Get the connection pool for the active database."""
         if self._active_role == DatabaseRole.PRIMARY:
             return self._primary_pool
@@ -521,7 +483,7 @@ class DatabaseManager:
         }
 
     def _get_database_status(
-        self, state: Optional[DatabaseState], pool: Optional[ThreadedConnectionPool], role: DatabaseRole
+        self, state: Optional[DatabaseState], pool: Optional[ConnectionPool], role: DatabaseRole
     ) -> Dict[str, Any]:
         """Get status for a single database."""
         if not state or not pool:

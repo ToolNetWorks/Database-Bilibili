@@ -202,10 +202,14 @@ def reset_sync_checkpoint():
         raise HTTPException(409, "No standby database configured")
 
     try:
-        with manager._standby_pool.connection() as conn:
-            conn.execute(
-                "UPDATE sync_checkpoint SET last_processed_id = 0, last_processed_at = NULL, lag_seconds = NULL WHERE id = 1"
-            )
-        return {"success": True, "message": "Checkpoint reset"}
+        conn = manager._standby_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sync_checkpoint SET last_processed_id = 0, last_processed_at = NULL, lag_seconds = NULL WHERE id = 1"
+                )
+            return {"success": True, "message": "Checkpoint reset"}
+        finally:
+            manager._standby_pool.putconn(conn)
     except Exception as e:
         raise HTTPException(500, f"Failed to reset checkpoint: {e}")
